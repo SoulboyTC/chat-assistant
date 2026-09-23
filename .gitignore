@@ -1,0 +1,20 @@
+# 凭据与本地状态，绝不提交
+.env
+.env.*
+!.env.example
+creds.json
+creds.json.*
+qrcode.png
+
+# 验证产物
+验证记录/
+*-results.json
+*.log
+
+# Python
+__pycache__/
+*.pyc
+
+# 系统
+.DS_Store
+Thumbs.db
