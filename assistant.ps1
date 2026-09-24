@@ -17,6 +17,7 @@ param(
     [switch]$SelfTest,
     [switch]$Smoke,
     [switch]$Test,
+    [switch]$Stress,
     [string]$Message = '',
     [string]$SceneKey = '',
     [string]$ReportPath = '',
@@ -27,6 +28,9 @@ $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 Add-Type -AssemblyName System.Net.Http
+# 必须先于异常处理器取值：处理器里要用它写 crash.log，
+# 之前放在下面，导致处理器一执行就因 $ScriptDir 为空而静默失败，日志永远写不出来。
+$ScriptDir = $PSScriptRoot
 [Windows.Forms.Application]::EnableVisualStyles()
 # 必须在创建任何控件之前设置，否则 WinForms 会拒绝修改
 # 作用：未处理异常走进状态栏，而不是弹出「数组索引为 Null」这种系统错误框
@@ -34,11 +38,18 @@ Add-Type -AssemblyName System.Net.Http
 [Windows.Forms.Application]::add_ThreadException({
     param($sender,$e)
     try {
-        Set-Status ('已忽略一次界面异常，不影响已有内容：' + $e.Exception.Message) $true
+        $diagPath = Join-Path $ScriptDir 'crash.log'
+        $info = '时间: ' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') + "`r`n" +
+                '类型: ' + $e.Exception.GetType().FullName + "`r`n" +
+                '消息: ' + $e.Exception.Message + "`r`n" +
+                '堆栈: ' + $e.Exception.StackTrace + "`r`n" +
+                '内部: ' + $(if ($e.Exception.InnerException) { $e.Exception.InnerException.Message } else { '无' }) + "`r`n" +
+                ('-' * 60) + "`r`n"
+        [IO.File]::AppendAllText($diagPath, $info, [Text.UTF8Encoding]::new($false))
     } catch { }
+    try { Set-Status ('已忽略一次界面异常，不影响已有内容：' + $e.Exception.Message) $true } catch { }
 })
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-$ScriptDir = $PSScriptRoot
 $AppTitle = '小罗聊天副手 · 2.0'
 $script:Version = '2.0'
 $script:DeadlineSeconds = 35
@@ -275,8 +286,10 @@ function Get-Scene([string]$sceneKey) {
     return $table[$sceneKey]
 }
 function Parse-Result([string]$content, [string]$sceneKey) {
-    $scene = Get-Scene $sceneKey
-    $tones = @($scene['Tones'])
+    # 变量名不能叫 $scene —— 会和界面上的 $scene 下拉框撞名，
+    # PowerShell 的动态作用域会让外层那个被覆盖成 null，导致切换场景时崩溃。
+    $sceneDef = Get-Scene $sceneKey
+    $tones = @($sceneDef['Tones'])
     if ($tones.Count -eq 0) { throw 'SCHEMA' }
     try {
         $s = $content.Trim()
@@ -409,17 +422,21 @@ $clear = Make-Button '新会话' 76
 $tools.Controls.AddRange(@($pin,$watch,$clear)); $table.Controls.Add($tools,0,1)
 $scenePanel = New-Object Windows.Forms.FlowLayoutPanel; $scenePanel.Dock = 'Fill'; $scenePanel.WrapContents = $false
 $sceneLabel = Make-Label '场景'; $sceneLabel.Dock = 'None'; $sceneLabel.Size = [Drawing.Size]::new(42,26)
-$scene = New-Object Windows.Forms.ComboBox; $scene.DropDownStyle = 'DropDownList'; $scene.Width = 150
+# 变量名必须是 $sceneBox，不能叫 $scene：
+# PowerShell 变量名不区分大小写，脚本顶层的 $scene 就是 $script:scene，
+# 而脚本里还有 $script:Scene（当前场景键，字符串）。两者会互相覆盖，
+# 一旦 Apply-Scene 写入 $script:Scene，$scene 就从控件变成字符串，
+# 后续 $scene.SelectedItem / Items 就会抛「数组索引的计算结果为 Null」。
+$sceneBox = New-Object Windows.Forms.ComboBox; $sceneBox.DropDownStyle = 'DropDownList'; $sceneBox.Width = 150
 foreach ($k in $SceneKeys) {
     $label = [string]$Scenes[$k]['Label']
     if (-not $label) { continue }
-    [void]$scene.Items.Add($label)
-    if ($null -eq $script:SceneKeyByLabel) { $script:SceneKeyByLabel = @{} }
+    [void]$sceneBox.Items.Add($label)
     $script:SceneKeyByLabel[$label] = $k
 }
-$scene.SelectedIndex = 0
+$sceneBox.SelectedIndex = 0
 $mask = New-Object Windows.Forms.CheckBox; $mask.Text = '基础脱敏'; $mask.Checked = $true; $mask.AutoSize = $true
-$scenePanel.Controls.AddRange(@($sceneLabel,$scene,$mask)); $table.Controls.Add($scenePanel,0,2)
+$scenePanel.Controls.AddRange(@($sceneLabel,$sceneBox,$mask)); $table.Controls.Add($scenePanel,0,2)
 $contextGroup = New-Object Windows.Forms.GroupBox; $contextGroup.Text = '我方已确认背景（可选）'; $contextGroup.Dock = 'Fill'
 $contextGroup.Font = [Drawing.Font]::new('Microsoft YaHei UI',9)
 $context = Make-TextBox; $context.MaxLength = 2000
@@ -630,15 +647,18 @@ $watch.Add_CheckedChanged({
     } else { Set-Status '已关闭剪贴板监听' }
 })
 $inputBox.Add_TextChanged({ Invalidate-Input }); $context.Add_TextChanged({ Invalidate-Input })
-$scene.Add_SelectedIndexChanged({
+$sceneBox.Add_SelectedIndexChanged({
+    # 事件脚本块里也要用 $sceneBox；$scene 已经被 $script:Scene 占用。
     # 用显示文本反查场景键，不依赖索引顺序（索引在重建/初始化时可能为 -1）
-    $label = [string]$scene.SelectedItem
-    if (-not $label) { return }
-    $map = $script:SceneKeyByLabel
-    if (-not $map -or -not $map.ContainsKey($label)) { return }
-    $target = [string]$map[$label]
-    if (-not $target -or $target -eq $script:Scene) { return }
-    Apply-Scene $target
+    try {
+        $label = [string]$sceneBox.SelectedItem
+        if (-not $label) { return }
+        $map = $script:SceneKeyByLabel
+        if (-not $map -or -not $map.ContainsKey($label)) { return }
+        $target = [string]$map[$label]
+        if (-not $target -or $target -eq $script:Scene) { return }
+        Apply-Scene $target
+    } catch { Set-Status ('切换场景时出错：' + $_.Exception.Message) $true }
 })
 $mask.Add_CheckedChanged({ Invalidate-Input })
 $consent.Add_CheckedChanged({ if (-not $consent.Checked -and $script:Busy) { Cancel-Analysis } })
@@ -853,6 +873,13 @@ public class AssistantFakeHandler : HttpMessageHandler {
             if (-not $script:SceneKeyByLabel.ContainsKey($lbl)) { $mapComplete = $false }
         }
         Check $mapComplete 'every scene is reachable from its combo label'
+        # 回归防线：$sceneBox 必须始终是控件。
+        # 历史 bug：控件曾叫 $scene，而 $script:Scene 是当前场景键（字符串），
+        # PowerShell 变量名不区分大小写，两者实为同一个变量，
+        # 切换场景会把控件覆盖成字符串，之后访问 .SelectedItem 直接崩溃。
+        Check ($sceneBox -is [Windows.Forms.ComboBox]) 'scene combo control is a ComboBox after scene switches'
+        Check ($script:Scene -is [string]) 'active scene key stays a string'
+        Check ($script:Scene -ne $sceneBox) 'active scene key never collides with the combo control'
         $JevKey = ''
         Write-Report @{status='PASS'; checks=$pass; count=$pass.Count; remote_calls=0; version=$script:Version; scenes=$SceneKeys.Count}
     } catch { Write-Report @{status='FAIL'; message=$_.Exception.Message; checks=$pass; version=$script:Version}; exit 1 }
@@ -860,7 +887,67 @@ public class AssistantFakeHandler : HttpMessageHandler {
     exit 0
 }
 
-if ($Smoke -or $Test) {
+if ($Stress) {
+    # PowerShell 的事件脚本块和函数各有独立作用域，$script: / $global: 都不可靠。
+    # 最稳的做法：把控件作为参数显式传进函数里。
+    function Invoke-StressStep([int]$step, $combo, $tabsCtl, $watchCtl, $maskCtl) {
+        if (-not $combo -or -not $tabsCtl) { throw 'STRESS: control not bound' }
+        switch ($step % 14) {
+            1 { $combo.SelectedIndex = 0 }
+            2 { $combo.SelectedIndex = 1 }
+            3 { $combo.SelectedIndex = 2 }
+            4 { Copy-Reply }
+            5 { $combo.SelectedIndex = 3 }
+            6 { $combo.SelectedIndex = 4 }
+            7 { $tabsCtl.SelectedIndex = 0 }
+            8 { $combo.SelectedIndex = 5 }
+            9 { $tabsCtl.SelectedIndex = 2; Copy-Reply }
+            10 { New-Conversation }
+            11 { $watchCtl.Checked = $true }
+            12 { $watchCtl.Checked = $false }
+            13 { $combo.SelectedIndex = 0; $combo.SelectedIndex = 4 }
+            0 { $maskCtl.Checked = (-not $maskCtl.Checked) }
+        }
+    }
+    # 真实窗口 + 模拟用户乱点：专门用来逼出界面异常
+    $script:StressErrors = New-Object Collections.ArrayList
+    $script:StressStep = 0
+    $script:StressContext = @{ Combo = $sceneBox; Tabs = $tabs; Watch = $watch; Mask = $mask }
+    [Windows.Forms.Application]::add_ThreadException({
+        param($sender,$e)
+        [void]$script:StressErrors.Add($e.Exception.GetType().Name + ': ' + $e.Exception.Message + ' @ ' + $e.Exception.StackTrace)
+    })
+    $watch.Checked = $false; $consent.Checked = $false
+    $stressWatch = [Diagnostics.Stopwatch]::StartNew()
+    $stressStep = 0
+    $stressTimer = New-Object Windows.Forms.Timer; $stressTimer.Interval = 40
+    $stressTimer.Add_Tick({
+        try {
+            $script:StressStep = [int]$script:StressStep + 1
+            $ctx = $script:StressContext
+            # 哈希表在事件块里要用索引取值，点号访问拿不到
+            Invoke-StressStep -step $script:StressStep -combo $ctx['Combo'] -tabsCtl $ctx['Tabs'] -watchCtl $ctx['Watch'] -maskCtl $ctx['Mask']
+        } catch {
+            [void]$script:StressErrors.Add('HANDLER: ' + $_.Exception.Message + ' @ ' + $_.InvocationInfo.PositionMessage)
+        }
+        if ($stressWatch.Elapsed.TotalSeconds -gt 5) {
+            $stressTimer.Stop()
+            $errs = @($script:StressErrors)
+            $report = @{
+                status = $(if ($errs.Count -eq 0) { 'PASS' } else { 'FAIL' })
+                mode = 'UI-stress'
+                steps = $script:StressStep
+                scene = $script:Scene
+                errors = $errs
+                version = $script:Version
+            }
+            if ($ReportPath) { [IO.File]::WriteAllText($ReportPath, ($report | ConvertTo-Json -Depth 6), [Text.UTF8Encoding]::new($false)) }
+            [Console]::WriteLine(($report | ConvertTo-Json -Depth 6))
+            $form.Close()
+        }
+    })
+    $form.Add_Shown({ $stressTimer.Start() })
+} elseif ($Smoke -or $Test) {
     # 测试模式不读剪贴板。-Test 只发送命令行给出的合成样例。
     $watch.Checked = $false; $consent.Checked = $Test.IsPresent
     $inputBox.Text = '客户：报告今天能给吗？客户一直在催。'
@@ -894,7 +981,7 @@ if ($Smoke -or $Test) {
         $script:Mutex.Dispose(); $form.Dispose(); exit 0
     }
 }
-try { $timer.Start(); if (-not $Smoke -and -not $Test) { $clipTimer.Start() }; [void]$form.ShowDialog() }
+try { $timer.Start(); if (-not $Smoke -and -not $Test -and -not $Stress) { $clipTimer.Start() }; [void]$form.ShowDialog() }
 finally {
     $timer.Dispose(); $clipTimer.Dispose(); $tip.Dispose(); $form.Dispose()
     if ($script:OwnsMutex) { $script:Mutex.ReleaseMutex() }
