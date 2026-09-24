@@ -1003,7 +1003,22 @@ Apply-Scene '客户'
 
 function Write-Report($data) {
     $json = $data | ConvertTo-Json -Depth 8
-    if ($ReportPath) { [IO.File]::WriteAllText($ReportPath,$json,[Text.UTF8Encoding]::new($false)) }
+    if ($ReportPath) {
+        # 调用方可能给相对路径，而 .NET 的 WriteAllText 是按「当前工作目录」解析的，
+        # 不一定是脚本所在目录。曾经因此把报告写到 c:\Users\666\WorkBuddy AI\Claw\验证记录\
+        # （不存在的目录）里，异常被全局处理器接住，表现成「测试跑完没有报告文件」。
+        # 这里统一按脚本目录补全，并顺手建好父目录。
+        $full = $ReportPath
+        if (-not [IO.Path]::IsPathRooted($full)) { $full = Join-Path $ScriptDir $full }
+        $parent = Split-Path -Parent $full
+        try {
+            if ($parent -and -not [IO.Directory]::Exists($parent)) { [void][IO.Directory]::CreateDirectory($parent) }
+            [IO.File]::WriteAllText($full, $json, [Text.UTF8Encoding]::new($false))
+        } catch {
+            # 报告写不出去不能影响测试本身的结论，退化成只打控制台
+            [Console]::WriteLine('WARN: 报告写入失败 ' + $_.Exception.Message)
+        }
+    }
     [Console]::WriteLine($json)
 }
 $SampleEmotion = '"emotion":{"label":"着急催进度","reason":"对方连用「今天能给吗」，语气偏急","dims":{"eagerness":{"v":82,"c":76},"warmth":{"v":45,"c":58},"conflict":{"v":28,"c":35},"pressure":{"v":80,"c":72}}}'
@@ -1300,7 +1315,7 @@ if ($Stress) {
                 errors = $errs
                 version = $script:Version
             }
-            if ($ReportPath) { [IO.File]::WriteAllText($ReportPath, ($report | ConvertTo-Json -Depth 6), [Text.UTF8Encoding]::new($false)) }
+            if ($ReportPath) { Write-Report $report }
             [Console]::WriteLine(($report | ConvertTo-Json -Depth 6))
             $form.Close()
         }
@@ -1323,8 +1338,17 @@ if ($Stress) {
             $guard.Stop()
             if ($script:Busy) { Finish-Failure 'TIMEOUT' }
             if ($PreviewPath) {
-                $bmp = [Drawing.Bitmap]::new($form.Width,$form.Height)
-                $form.DrawToBitmap($bmp,[Drawing.Rectangle]::new(0,0,$form.Width,$form.Height)); $bmp.Save($PreviewPath,[Drawing.Imaging.ImageFormat]::Png); $bmp.Dispose()
+                # 和报告一样：相对路径按脚本目录解析，父目录缺了就建
+                $shot = $PreviewPath
+                if (-not [IO.Path]::IsPathRooted($shot)) { $shot = Join-Path $ScriptDir $shot }
+                try {
+                    $shotParent = Split-Path -Parent $shot
+                    if ($shotParent -and -not [IO.Directory]::Exists($shotParent)) { [void][IO.Directory]::CreateDirectory($shotParent) }
+                    $bmp = [Drawing.Bitmap]::new($form.Width,$form.Height)
+                    $form.DrawToBitmap($bmp,[Drawing.Rectangle]::new(0,0,$form.Width,$form.Height)); $bmp.Save($shot,[Drawing.Imaging.ImageFormat]::Png); $bmp.Dispose()
+                } catch {
+                    [Console]::WriteLine('WARN: 截图写入失败 ' + $_.Exception.Message)
+                }
             }
             $ok = $Smoke -or ($script:Outcome -eq 'ok')
             # 附带情绪图表状态，方便验证模型是否真的返回了 emotion 并被解析成功

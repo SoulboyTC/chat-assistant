@@ -1,4 +1,5 @@
 # 凭据与本地状态，绝不提交
+# 微信机器人已下线归档，但凭据规则保留：万一以后复用，不至于漏保护
 .env
 .env.*
 !.env.example
@@ -10,10 +11,6 @@ qrcode.png
 验证记录/
 *-results.json
 *.log
-
-# Python
-__pycache__/
-*.pyc
 
 # 系统
 .DS_Store

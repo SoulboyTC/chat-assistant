@@ -133,8 +133,7 @@ TYPESAFE_MODEL=jev-latest
 | `聊天助手.bat` | 双击启动聊天副手 |
 | `validate-assistant.ps1` | 验证入口，三种模式见下 |
 | `archive/v1/` | 1.0 版本留档（单客户场景），需要时还能跑 |
-| `bot.py` | 另一个实验：微信机器人，把消息交给模型判断后回消息 |
-| `start.bat` / `demo.bat` | 上面那个机器人的启动器 |
+| `archive/wechat-bot/` | 早期实验留档：微信机器人（`bot.py` + 启动器）。功能已被 2.0 的「判断+起草」覆盖，且需要 Python 依赖，故下线归档 |
 
 ### 验证
 
@@ -146,7 +145,13 @@ powershell -ExecutionPolicy Bypass -File validate-assistant.ps1 -Mode Test   # �
 
 离线回归用 .NET 假 HTTP 处理器驱动**同一套界面状态机**，覆盖成功、取消、超时、各类 HTTP 错误、格式校验、缓存命中、场景隔离、敏感信息拦截，以及情绪维度解析（强度与把握度分离、越界分数拒绝、缺字段时降级不失败）。全程 0 次远程请求。当前 **86 项断言全部通过**。结果写在 `验证记录/` 下。
 
-另有一个 `-Stress` 模式：在真实窗口里每 40ms 模拟乱点（轮切六个场景 / 点复制 / 开关监听），用来复现和拦截界面崩溃。修复历史 bug 后，连跑多轮 97+ 步均为 0 异常。
+另有一个 `-Stress` 模式：在真实窗口里每 40ms 模拟乱点（轮切六个场景 / 点复制 / 开关监听），用来复现和拦截界面崩溃。修复历史 bug 后，连跑多轮 90+ 步均为 0 异常。
+
+```
+powershell -ExecutionPolicy Bypass -File validate-assistant.ps1 -Mode Stress  # 真实窗口压力测试
+```
+
+> 报告与截图路径统一按脚本目录解析：即使从别的目录调用，也不会把文件写到意外的位置。
 
 ---
 
