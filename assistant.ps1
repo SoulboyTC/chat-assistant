@@ -28,6 +28,15 @@ Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 Add-Type -AssemblyName System.Net.Http
 [Windows.Forms.Application]::EnableVisualStyles()
+# 必须在创建任何控件之前设置，否则 WinForms 会拒绝修改
+# 作用：未处理异常走进状态栏，而不是弹出「数组索引为 Null」这种系统错误框
+[Windows.Forms.Application]::SetUnhandledExceptionMode([Windows.Forms.UnhandledExceptionMode]::CatchException)
+[Windows.Forms.Application]::add_ThreadException({
+    param($sender,$e)
+    try {
+        Set-Status ('已忽略一次界面异常，不影响已有内容：' + $e.Exception.Message) $true
+    } catch { }
+})
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 $ScriptDir = $PSScriptRoot
 $AppTitle = '小罗聊天副手 · 2.0'
@@ -48,6 +57,7 @@ $script:Client = $null
 $script:Mutex = $null
 $script:OwnsMutex = $false
 $script:Scene = '客户'
+$script:SceneKeyByLabel = @{}
 $script:LastSchemaError = ''
 $script:LastSchemaAt = ''
 $script:LastSchemaStack = ''
@@ -400,7 +410,13 @@ $tools.Controls.AddRange(@($pin,$watch,$clear)); $table.Controls.Add($tools,0,1)
 $scenePanel = New-Object Windows.Forms.FlowLayoutPanel; $scenePanel.Dock = 'Fill'; $scenePanel.WrapContents = $false
 $sceneLabel = Make-Label '场景'; $sceneLabel.Dock = 'None'; $sceneLabel.Size = [Drawing.Size]::new(42,26)
 $scene = New-Object Windows.Forms.ComboBox; $scene.DropDownStyle = 'DropDownList'; $scene.Width = 150
-foreach ($k in $SceneKeys) { [void]$scene.Items.Add($Scenes[$k]['Label']) }
+foreach ($k in $SceneKeys) {
+    $label = [string]$Scenes[$k]['Label']
+    if (-not $label) { continue }
+    [void]$scene.Items.Add($label)
+    if ($null -eq $script:SceneKeyByLabel) { $script:SceneKeyByLabel = @{} }
+    $script:SceneKeyByLabel[$label] = $k
+}
 $scene.SelectedIndex = 0
 $mask = New-Object Windows.Forms.CheckBox; $mask.Text = '基础脱敏'; $mask.Checked = $true; $mask.AutoSize = $true
 $scenePanel.Controls.AddRange(@($sceneLabel,$scene,$mask)); $table.Controls.Add($scenePanel,0,2)
@@ -500,7 +516,8 @@ function Show-Result($obj, [string]$origin) {
     $facts.Text = "$($cur['Facts'])：$($obj.summary)`r`n线索：$($obj.urgency) / $($obj.tone)（仅供参考）`r`n待核实：$($obj.missing)`r`n提醒：$($obj.caution)"
     $replyMap = @{}
     foreach ($prop in $obj.replies.PSObject.Properties) { $replyMap[$prop.Name] = $prop.Value }
-    for ($i = 0; $i -lt $curTones.Count; $i++) {
+    $limit = [Math]::Min($curTones.Count, $script:ReplyBoxes.Count)
+    for ($i = 0; $i -lt $limit; $i++) {
         $toneKey = [string]$curTones[$i]['Key']
         if ($replyMap.ContainsKey($toneKey)) { $script:ReplyBoxes[$i].Text = [string]$replyMap[$toneKey] }
     }
@@ -590,8 +607,13 @@ function Fill-Clipboard {
 }
 function Copy-Reply {
     if (-not $script:ValidResult -or $script:Busy) { return }
-    $text = $script:ReplyBoxes[$tabs.SelectedIndex].Text.Trim()
-    if (-not $text) { return }
+    # 页签刚重建、或 SelectedIndex 为 -1 时，直接索引会越界
+    $idx = $tabs.SelectedIndex
+    if ($idx -lt 0 -or $idx -ge $script:ReplyBoxes.Count) {
+        Set-Status '请先切到某一档草稿页签再复制' $true; return
+    }
+    $text = [string]$script:ReplyBoxes[$idx].Text
+    if (-not $text.Trim()) { return }
     try {
         [Windows.Forms.Clipboard]::SetText($text)
         $script:SelfClip = $text; $script:LastClip = $text
@@ -608,7 +630,16 @@ $watch.Add_CheckedChanged({
     } else { Set-Status '已关闭剪贴板监听' }
 })
 $inputBox.Add_TextChanged({ Invalidate-Input }); $context.Add_TextChanged({ Invalidate-Input })
-$scene.Add_SelectedIndexChanged({ Apply-Scene $SceneKeys[$scene.SelectedIndex] })
+$scene.Add_SelectedIndexChanged({
+    # 用显示文本反查场景键，不依赖索引顺序（索引在重建/初始化时可能为 -1）
+    $label = [string]$scene.SelectedItem
+    if (-not $label) { return }
+    $map = $script:SceneKeyByLabel
+    if (-not $map -or -not $map.ContainsKey($label)) { return }
+    $target = [string]$map[$label]
+    if (-not $target -or $target -eq $script:Scene) { return }
+    Apply-Scene $target
+})
 $mask.Add_CheckedChanged({ Invalidate-Input })
 $consent.Add_CheckedChanged({ if (-not $consent.Checked -and $script:Busy) { Cancel-Analysis } })
 $form.Add_KeyDown({
@@ -792,6 +823,36 @@ public class AssistantFakeHandler : HttpMessageHandler {
         $jevOk = $false; try { $null = Assert-Endpoint 'https://api.typesafe.ai/v1/systemone' 'x'; $jevOk = $true } catch { }
         Check $jevOk 'endpoint allowlist accepts official jev host'
         Check ((Test-Path -LiteralPath (Join-Path $ScriptDir 'archive\v1\assistant.ps1'))) 'v1 archived alongside v2'
+
+        # —— 索引越界防护（用户实际遇到过的崩溃）——
+        $savedIndex = $tabs.SelectedIndex
+        $tabs.SelectedIndex = -1
+        $threw = $false
+        try { Copy-Reply } catch { $threw = $true }
+        Check (-not $threw) 'copy with no tab selected does not throw'
+        $tabs.SelectedIndex = $savedIndex
+        $threw2 = $false
+        try { Apply-Scene '朋友'; Apply-Scene '群聊'; Apply-Scene '客户' } catch { $threw2 = $true }
+        Check (-not $threw2) 'repeated scene switching does not throw'
+        Check ($script:ReplyBoxes.Count -eq 3) 'reply widgets stay in sync with scene'
+        # 每个场景都必须有独立的三档语气
+        $toneCountsOk = $true
+        foreach ($k in $SceneKeys) {
+            $c = @($Scenes[$k]['Tones']).Count
+            if ($c -lt 3) { $toneCountsOk = $false }
+        }
+        Check $toneCountsOk 'every scene defines at least three tones'
+        # 下拉框项与场景键必须一一对应，否则 SelectedIndex 会错位
+        # 注意：控件句柄未创建时 ComboBox.Items.Count 会返回 0，
+        # 所以断言查反查表而不是 Items（后者在无窗口的自测环境里不可靠）
+        $mapCount = @($script:SceneKeyByLabel.Keys).Count
+        Check ($mapCount -eq @($SceneKeys).Count) 'scene label lookup covers every scene'
+        $mapComplete = $true
+        foreach ($k in $SceneKeys) {
+            $lbl = [string]$Scenes[$k]['Label']
+            if (-not $script:SceneKeyByLabel.ContainsKey($lbl)) { $mapComplete = $false }
+        }
+        Check $mapComplete 'every scene is reachable from its combo label'
         $JevKey = ''
         Write-Report @{status='PASS'; checks=$pass; count=$pass.Count; remote_calls=0; version=$script:Version; scenes=$SceneKeys.Count}
     } catch { Write-Report @{status='FAIL'; message=$_.Exception.Message; checks=$pass; version=$script:Version}; exit 1 }
